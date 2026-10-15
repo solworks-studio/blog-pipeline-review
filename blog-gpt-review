@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""블로그 파이프라인 GPT 검수 실행 도구 (구축 2단계).
+
+초안 파일 + F목록 파일을 받아 검수 프롬프트(auditor v1)와 함께
+기존 gpt-chat CLI(OpenAI API)로 보내고, 판정을 엄격하게 파싱해
+검수 기록 파일을 남긴다.
+
+원칙:
+- 검수 호출이 실패하면 통과로 처리하지 않는다 (exit 2).
+- 판정 줄을 파싱하지 못하면 통과로 처리하지 않는다 (exit 12).
+- 종료 코드: 통과 0 / 수정필요 10 / 반려 11 / 파싱실패 12 / 호출실패 2
+
+Usage:
+    blog-gpt-review --id B2-20261014-04 --draft draft.md --facts facts.md \
+        --title "확정 제목" --out reviews/B2-20261014-04-review.md
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+BASE = Path(__file__).resolve().parent.parent
+GPT_CHAT = Path.home() / "workspace/skills/openai/bin/gpt-chat"
+DEFAULT_PROMPT = BASE / "prompts/auditor-v1.md"
+
+VERDICT_CODES = {"통과": 0, "수정필요": 10, "반려": 11}
+
+
+def extract_body_and_tags(text: str):
+    body = None
+    m = re.search(r"## 본문[^\n]*\n(.*?)(?=\n## 태그 후보|\n---\s*\n\(근거 메모|\Z)", text, re.S)
+    if m:
+        body = m.group(1).strip()
+    tags = None
+    t = re.search(r"## 태그 후보\s*\n(.+)", text)
+    if t:
+        tags = t.group(1).strip().splitlines()[0].strip()
+    if body is None:
+        # 본문 섹션을 못 찾으면 파일 전체에서 첫 제목 줄만 빼고 사용
+        lines = text.splitlines()
+        body = "\n".join(lines[1:]).strip() if len(lines) > 1 else text.strip()
+    return body, tags
+
+
+def main():
+    ap = argparse.ArgumentParser(description="블로그 초안 GPT 검수 (F목록 대조)")
+    ap.add_argument("--id", required=True, help="글 ID (예: B2-20261014-04)")
+    ap.add_argument("--draft", required=True, help="초안 파일 경로")
+    ap.add_argument("--facts", required=True, help="F목록 파일 경로")
+    ap.add_argument("--title", required=True, help="확정 제목")
+    ap.add_argument("--out", required=True, help="검수 기록 출력 경로")
+    ap.add_argument("--prompt", default=str(DEFAULT_PROMPT), help="검수 프롬프트 파일")
+    ap.add_argument("--model", default="gpt-4o-mini")
+    ap.add_argument("--max-tokens", type=int, default=3000)
+    args = ap.parse_args()
+
+    draft_text = Path(args.draft).read_text(encoding="utf-8", errors="replace")
+    facts_text = Path(args.facts).read_text(encoding="utf-8", errors="replace")
+    body, tags = extract_body_and_tags(draft_text)
+
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    user_msg = (
+        f"# 검수 대상\n\n"
+        f"글 ID: {args.id}\n"
+        f"확정 제목: {args.title}\n\n"
+        f"## F목록\n\n{facts_text.strip()}\n\n"
+        f"## 본문\n\n{body}\n"
+    )
+    if tags:
+        user_msg += f"\n## 태그\n\n{tags}\n"
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path = out_path.with_suffix("").with_suffix(".input.md")
+    input_path.write_text(user_msg, encoding="utf-8")
+
+    header = (
+        f"# GPT 검수 기록 — {args.id}\n\n"
+        f"- 검수일시: {now.strftime('%Y-%m-%d %H:%M')} KST\n"
+        f"- 검수자: ChatGPT API ({args.model}), 프롬프트 auditor v1\n"
+        f"- 초안 파일: {args.draft}\n"
+        f"- F목록 파일: {args.facts}\n"
+        f"- 확정 제목: {args.title}\n"
+    )
+
+    try:
+        proc = subprocess.run(
+            [
+                str(GPT_CHAT),
+                "--system-file", args.prompt,
+                "--user-file", str(input_path),
+                "--model", args.model,
+                "--temperature", "0.2",
+                "--max-tokens", str(args.max_tokens),
+            ],
+            capture_output=True, text=True, timeout=300,
+        )
+    except Exception as e:
+        out_path.write_text(header + f"\n## 결과\n\n호출 실패: {e}\n", encoding="utf-8")
+        print(json.dumps({"ok": False, "id": args.id, "error": f"call failed: {e}"}, ensure_ascii=False))
+        return 2
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()[:800]
+        out_path.write_text(header + f"\n## 결과\n\n호출 실패: {err}\n", encoding="utf-8")
+        print(json.dumps({"ok": False, "id": args.id, "error": err}, ensure_ascii=False))
+        return 2
+
+    try:
+        data = json.loads(proc.stdout)
+        text = data["text"]
+        usage = data.get("usage", {})
+        model_used = data.get("model", args.model)
+    except Exception as e:
+        out_path.write_text(header + f"\n## 결과\n\n응답 파싱 실패: {e}\n원응답: {proc.stdout[:800]}\n", encoding="utf-8")
+        print(json.dumps({"ok": False, "id": args.id, "error": f"response parse failed: {e}"}, ensure_ascii=False))
+        return 2
+
+    vm = re.search(r"^판정:\s*(통과|수정필요|반려)\s*$", text, re.M)
+    if not vm:
+        out_path.write_text(
+            header + f"\n- 모델: {model_used}\n\n## 결과\n\n판정 파싱 실패 — 통과로 처리하지 않음.\n\n## GPT 원문\n\n{text}\n",
+            encoding="utf-8",
+        )
+        print(json.dumps({"ok": False, "id": args.id, "verdict": "파싱실패", "review_file": str(out_path)}, ensure_ascii=False))
+        return 12
+
+    verdict = vm.group(1)
+    out_path.write_text(
+        header
+        + f"- 모델: {model_used}\n"
+        + f"- 토큰: prompt {usage.get('prompt_tokens')} / completion {usage.get('completion_tokens')}\n"
+        + f"- 판정: **{verdict}**\n\n## GPT 검수 원문\n\n{text}\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(
+        {"ok": True, "id": args.id, "verdict": verdict, "review_file": str(out_path), "usage": usage},
+        ensure_ascii=False,
+    ))
+    return VERDICT_CODES[verdict]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
