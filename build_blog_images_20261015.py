@@ -70,7 +70,7 @@ def make_thumbnail(post_dir, big_lines, sub, accent=GOLD):
         print(f"SKIP {post_dir}: no bg")
         return None
     img = Image.open(bgs[0]).convert("RGB")
-    img = cover(img, 1200, 630)
+    img = cover(img, 1200, 1200)  # 썸네일 1:1 비율 (2026-10-16 사용자 지시)
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
     draw = ImageDraw.Draw(img)
