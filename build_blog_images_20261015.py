@@ -20,7 +20,6 @@ GRAY = (96, 108, 122)
 LINE = (214, 221, 230)
 RED = (203, 52, 44)
 BG_SOFT = (244, 247, 250)
-GOLD = (255, 209, 102)
 
 
 def kr_index(path):
@@ -64,7 +63,8 @@ def cover(img, w, h):
     return img.crop((x, y, x + w, y + h))
 
 
-def make_thumbnail(post_dir, big_lines, sub, accent=GOLD):
+def make_thumbnail(post_dir, big_lines, sub):
+    # 썸네일에 의미 없는 장식선(노란 액센트 선 등)을 넣지 않는다 (2026-10-17 확정)
     bgs = glob.glob(os.path.join(BASE, post_dir, "media-generation-thumb-bg-*.webp"))
     if not bgs:
         print(f"SKIP {post_dir}: no bg")
@@ -87,7 +87,6 @@ def make_thumbnail(post_dir, big_lines, sub, accent=GOLD):
     for s in big_lines:
         draw.text((44 + 36, y), s, font=big_f, fill=WHITE)
         y += 118
-    draw.line([44 + 38, y + 4, 44 + 38 + 64, y + 4], fill=accent, width=7)
     draw.text((44 + 36, y + 18), sub, font=sub_f, fill=(235, 240, 246))
     out = os.path.join(BASE, post_dir, "thumb.png")
     img.convert("RGB").save(out, quality=95)
